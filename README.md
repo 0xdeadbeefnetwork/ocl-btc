@@ -19,6 +19,7 @@ User Interaction:
 
 Number of Wallets: The script allows the user to specify how many wallets to generate, making it versatile for different needs.
 Clean Output: We suppress unnecessary warnings and provide a clean output of the generated private keys, public keys, and Bitcoin addresses.
+
 🔧 Code Highlights:
 
 OpenCL Kernel Code: Efficiently handles random data generation on the GPU.

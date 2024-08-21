@@ -1,161 +1,153 @@
-import os
-import time
 import pyopencl as cl
 import numpy as np
-from bit import Key
+import hashlib
+import os
+import time
+import ecdsa
+import base58
+import warnings
+import argparse
 
-SAVE_FILE = 'last_btc_key.txt'
-NUM_KEYS = 8192
+# Part of being paranoid is writing your own code.
+# Because I don't trust anybody.
+# Let's generate our bitcoin wallets using OpenCL.
+# Pull some data from the frame buffers of the gpu to seed.
+# run this 8192 times. Include date, unix epoch time. True random.
+# Thanks AMD. 
+# <3 
 
-def hex_to_wif(private_key_hex):
-    key = Key.from_hex(private_key_hex)
-    return key.to_wif()
 
-def private_key_to_p2pkh(private_key_hex):
-    key = Key.from_hex(private_key_hex)
-    return key.address()  # Ensure this method is correct
+# Suppress specific warnings from pyopencl
+def suppress_pyopencl_warnings():
+    warnings.filterwarnings("ignore", category=UserWarning, module='pyopencl')
 
-def private_key_to_p2wpkh_p2sh(private_key_hex):
-    key = Key.from_hex(private_key_hex)
-    return key.p2wpkh_p2sh_address()  # Ensure this method is correct
+suppress_pyopencl_warnings()
 
-def private_key_to_p2wpkh(private_key_hex):
-    key = Key.from_hex(private_key_hex)
-    return key.p2wpkh_address()  # Ensure this method is correct
+# OpenCL Kernel Code
+kernel_code = """
+__kernel void generate_random_data(__global unsigned char *data, int width, int height) {
+    int id = get_global_id(0);
+    int x = id % width;
+    int y = id / width;
 
-def load_last_key():
-    if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE, 'r') as f:
-            try:
-                return int(f.read().strip(), 16)
-            except ValueError:
-                return 0
-    return 0
+    if (x >= width || y >= height) return;
 
-def save_last_key(private_key_int):
-    with open(SAVE_FILE, 'w') as f:
-        f.write(f"{private_key_int:064x}")
+    // Initialize seed based on position and ID
+    unsigned int seed = (x * y + id + get_global_id(1)) * 0x87654321;
 
-def split_256bit_key(key):
-    return (np.uint64(key >> 192), np.uint64((key >> 128) & 0xFFFFFFFFFFFFFFFF),
-            np.uint64((key >> 64) & 0xFFFFFFFFFFFFFFFF), np.uint64(key & 0xFFFFFFFFFFFFFFFF))
+    // Perform 8192 rounds of mixing
+    for (int i = 0; i < 8192; ++i) {
+        seed = (seed * 1103515245 + 12345) % 0x100000000;
+    }
 
-def combine_256bit_key(key_parts):
-    return (int(key_parts[0]) << 192) | (int(key_parts[1]) << 128) | (int(key_parts[2]) << 64) | int(key_parts[3])
+    // Output the highest byte of the seed as random data
+    data[id] = (unsigned char)(seed >> 24);
+}
+"""
 
-def setup_opencl():
-    try:
-        platforms = cl.get_platforms()
-        devices = platforms[0].get_devices(cl.device_type.GPU)
-        if not devices:
-            raise RuntimeError("No GPU devices found.")
-        
-        context = cl.Context([devices[0]])
-        queue = cl.CommandQueue(context)
+def initialize_opencl():
+    platforms = cl.get_platforms()
+    platform = platforms[0]
+    devices = platform.get_devices(cl.device_type.GPU)
+    device = devices[0]
+    context = cl.Context([device])
+    queue = cl.CommandQueue(context)
+    program = cl.Program(context, kernel_code).build()
+    return context, queue, program
 
-        kernel_code = """
-        __kernel void increment_keys(__global ulong* keys_high, __global ulong* keys_mid1, 
-                                     __global ulong* keys_mid2, __global ulong* keys_low) {
-            int gid = get_global_id(0);
-            keys_low[gid] += 1;
-            if (keys_low[gid] == 0) {
-                keys_mid2[gid] += 1;
-                if (keys_mid2[gid] == 0) {
-                    keys_mid1[gid] += 1;
-                    if (keys_mid1[gid] == 0) {
-                        keys_high[gid] += 1;
-                    }
-                }
-            }
-        }
-        """
-
-        program = cl.Program(context, kernel_code).build()
-        kernel = cl.Kernel(program, "increment_keys")
-        local_size = kernel.get_work_group_info(cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE, devices[0])
-
-        return context, queue, program, local_size
+def generate_random_data_from_gpu(width, height):
+    context, queue, program = initialize_opencl()
+    num_elements = width * height
+    data = np.empty(num_elements, dtype=np.uint8)
     
-    except cl.Error as e:
-        print(f"OpenCL error: {e}")
-        raise
+    mf = cl.mem_flags
+    data_buffer = cl.Buffer(context, mf.WRITE_ONLY, data.nbytes)
+    
+    kernel = program.generate_random_data
+    kernel.set_args(data_buffer, np.int32(width), np.int32(height))
+    cl.enqueue_nd_range_kernel(queue, kernel, (num_elements,), None)
+    cl.enqueue_copy(queue, data, data_buffer).wait()
+    
+    return data
 
-    except Exception as e:
-        print(f"General error: {e}")
-        raise
+def generate_private_key():
+    width, height = 32, 32  # Dimensions for generating random data
+    random_data = generate_random_data_from_gpu(width, height)
+    
+    # Additional entropy sources
+    os_random_bytes = os.urandom(32)
+    current_time = str(time.time()).encode('utf-8')
+    current_data = os.popen("wmic os get /value").read().encode('utf-8')  # Example command for Windows, change if necessary
 
-def generate_private_keys(start_value, num_keys=NUM_KEYS):
-    max_value = 2**256 - 1
-    start_key_parts = split_256bit_key(start_value)
+    # Combine all entropy sources
+    combined_entropy = bytearray(random_data) + bytearray(os_random_bytes) + current_time + current_data
+    
+    # Hash to ensure randomness
+    private_key = hashlib.sha256(combined_entropy).hexdigest()
+    return private_key[:64]  # Ensure the key is 64 hex characters (256 bits)
 
-    context, queue, program, local_size = setup_opencl()
+def generate_wif_key(private_key):
+    # Convert private key to bytes and add network byte
+    private_key_bytes = bytes.fromhex(private_key)
+    network_byte = b'\x80' + private_key_bytes
+    
+    # Perform SHA256 twice
+    checksum = hashlib.sha256(hashlib.sha256(network_byte).digest()).digest()[:4]
+    
+    # Append checksum to the end of network byte-prefixed private key
+    wif_bytes = network_byte + checksum
+    
+    # Encode in Base58
+    wif_key = base58.b58encode(wif_bytes).decode('utf-8')
+    return wif_key
 
-    keys_high = np.full(num_keys, start_key_parts[0], dtype=np.uint64)
-    keys_mid1 = np.full(num_keys, start_key_parts[1], dtype=np.uint64)
-    keys_mid2 = np.full(num_keys, start_key_parts[2], dtype=np.uint64)
-    keys_low = np.array([start_key_parts[3] + i for i in range(num_keys)], dtype=np.uint64)
+def generate_public_key(private_key):
+    # Generate public key from private key using ECDSA
+    private_key_bytes = bytes.fromhex(private_key)
+    sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=ecdsa.SECP256k1)
+    vk = sk.verifying_key
+    public_key = b'\x04' + vk.to_string()  # Prefix with 0x04 for uncompressed format
+    return public_key
 
-    buffer_high = cl.Buffer(context, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=keys_high)
-    buffer_mid1 = cl.Buffer(context, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=keys_mid1)
-    buffer_mid2 = cl.Buffer(context, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=keys_mid2)
-    buffer_low = cl.Buffer(context, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=keys_low)
+def generate_bitcoin_address(public_key):
+    # Perform SHA256 followed by RIPEMD160 hash on the public key
+    sha256 = hashlib.sha256(public_key).digest()
+    ripemd160 = hashlib.new('ripemd160', sha256).digest()
+    
+    # Add network byte (0x00 for Bitcoin mainnet)
+    network_byte = b'\x00' + ripemd160
+    
+    # Perform SHA256 twice for checksum
+    checksum = hashlib.sha256(hashlib.sha256(network_byte).digest()).digest()[:4]
+    
+    # Concatenate network byte, RIPEMD160 hash, and checksum
+    address_bytes = network_byte + checksum
+    
+    # Encode in Base58
+    bitcoin_address = base58.b58encode(address_bytes).decode('utf-8')
+    return bitcoin_address
 
-    processed_keys = set()
-
-    try:
-        while True:
-            global_size = (num_keys,)
-            program.increment_keys(queue, global_size, (local_size,), buffer_high, buffer_mid1, buffer_mid2, buffer_low)
-            
-            cl.enqueue_copy(queue, keys_high, buffer_high).wait()
-            cl.enqueue_copy(queue, keys_mid1, buffer_mid1).wait()
-            cl.enqueue_copy(queue, keys_mid2, buffer_mid2).wait()
-            cl.enqueue_copy(queue, keys_low, buffer_low).wait()
-
-            new_keys = []
-
-            for i in range(num_keys):
-                private_key_parts = (keys_high[i], keys_mid1[i], keys_mid2[i], keys_low[i])
-                private_key_int = combine_256bit_key(private_key_parts)
-
-                if private_key_int > max_value:
-                    private_key_int = 0
-
-                private_key_hex = f"{private_key_int:064x}"
-                if private_key_hex in processed_keys:
-                    continue
-
-                processed_keys.add(private_key_hex)
-                new_keys.append((private_key_hex, private_key_int))
-
-            for private_key_hex, private_key_int in new_keys:
-                try:
-                    wif_key = hex_to_wif(private_key_hex)
-                    p2pkh_address = private_key_to_p2pkh(private_key_hex)
-                    p2wpkh_p2sh_address = private_key_to_p2wpkh_p2sh(private_key_hex)
-                    p2wpkh_address = private_key_to_p2wpkh(private_key_hex)
-
-                    # Print private key in Electrum-compatible format
-                    print(f"Private Key (p2pkh): p2pkh:{wif_key}")
-                    print(f"Address (p2pkh): {p2pkh_address}")
-                    print(f"Private Key (p2wpkh-p2sh): p2wpkh-p2sh:{wif_key}")
-                    print(f"Address (p2wpkh-p2sh): {p2wpkh_p2sh_address}")
-                    print(f"Private Key (p2wpkh): p2wpkh:{wif_key}")
-                    print(f"Address (p2wpkh): {p2wpkh_address}")
-                    print("-" * 80)
-
-                except ValueError:
-                    pass
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Exiting...")
-
-    finally:
-        save_last_key(combine_256bit_key((keys_high[-1], keys_mid1[-1], keys_mid2[-1], keys_low[-1])))
+def generate_wallets(num_wallets):
+    for i in range(num_wallets):
+        private_key = generate_private_key()
+        wif_key = generate_wif_key(private_key)
+        public_key = generate_public_key(private_key)
+        bitcoin_address = generate_bitcoin_address(public_key)
+        
+        print(f"Wallet {i+1}:")
+        print(f"Private Key (WIF): {wif_key}")
+        print(f"Public Key: {public_key.hex()}")
+        print(f"Bitcoin Address: {bitcoin_address}\n")
 
 def main():
-    start_value = load_last_key()
-    generate_private_keys(start_value)
+    parser = argparse.ArgumentParser(description="Generate Bitcoin wallets")
+    parser.add_argument('num_wallets', type=int, help="Number of wallets to generate")
+    args = parser.parse_args()
+
+    print("Generating wallets...\n")
+    generate_wallets(args.num_wallets)
+    print("Wallet generation complete.")
+    print("\nCredit: _SiCK https://afflicted.sh")
 
 if __name__ == "__main__":
     main()
